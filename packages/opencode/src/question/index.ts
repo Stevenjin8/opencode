@@ -134,7 +134,9 @@ export namespace Question {
   }
 
   async function auto(url: string, info: Request, controllers?: AbortController[]) {
-    const result = await Promise.all(info.questions.map((question, index) => notify(url, question, controllers?.[index])))
+    const result = await Promise.all(
+      info.questions.map((question, index) => notify(url, question, controllers?.[index], info.id, index)),
+    )
     if (result.some((answer) => !answer)) return
     await reply({
       requestID: info.id,
@@ -142,13 +144,22 @@ export namespace Question {
     })
   }
 
-  async function notify(url: string, question: Info, controller?: AbortController) {
+  async function notify(url: string, question: Info, controller?: AbortController, id?: string, index?: number) {
     const payload = encode(question)
     log.info("auto reply request", {
       url,
       type: payload.type,
       title: payload.title,
       options: payload.options?.length ?? 0,
+    })
+    logDebug({
+      id,
+      index,
+      url,
+      type: payload.type,
+      title: payload.title,
+      message: payload.message,
+      options: payload.options,
     })
     const body = JSON.stringify(payload)
     const res = await fetch(url, {
@@ -241,6 +252,14 @@ export namespace Question {
       log.warn("auto reply response invalid json", { error })
       return undefined
     }
+  }
+
+  function logDebug(data: Record<string, unknown>) {
+    void Bun.write(Bun.file("./debug"), JSON.stringify({ time: new Date().toISOString(), ...data }) + "\n", {
+      append: true,
+    }).catch((error) => {
+      log.warn("auto reply debug write failed", { error })
+    })
   }
 
   export async function reply(input: { requestID: string; answers: Answer[] }): Promise<void> {
