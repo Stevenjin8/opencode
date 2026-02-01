@@ -1,5 +1,6 @@
 import { Bus } from "@/bus"
 import { BusEvent } from "@/bus/bus-event"
+import { Env } from "@/env"
 import { Identifier } from "@/id/id"
 import { Instance } from "@/project/instance"
 import { Log } from "@/util/log"
@@ -86,6 +87,7 @@ export namespace Question {
         info: Request
         resolve: (answers: Answer[]) => void
         reject: (e: any) => void
+        controller?: AbortController
       }
     > = {}
 
@@ -101,23 +103,78 @@ export namespace Question {
   }): Promise<Answer[]> {
     const s = await state()
     const id = Identifier.ascending("question")
+    const url = Env.get("OPENCODE_QUESTION_URL")
+    const controller = url ? new AbortController() : undefined
+    const info: Request = {
+      id,
+      sessionID: input.sessionID,
+      questions: input.questions,
+      tool: input.tool,
+    }
 
     log.info("asking", { id, questions: input.questions.length })
 
-    return new Promise<Answer[]>((resolve, reject) => {
-      const info: Request = {
-        id,
-        sessionID: input.sessionID,
-        questions: input.questions,
-        tool: input.tool,
-      }
+    const promise = new Promise<Answer[]>((resolve, reject) => {
       s.pending[id] = {
         info,
         resolve,
         reject,
+        controller,
       }
       Bus.publish(Event.Asked, info)
     })
+    if (url) {
+      void auto(url, info, controller)
+    }
+    return promise
+  }
+
+  async function auto(url: string, info: Request, controller?: AbortController) {
+    const payload = info.questions.length === 1 ? encode(info.questions[0]) : info.questions.map(encode)
+    const body = JSON.stringify(payload)
+    const res = await fetch(url, {
+      method: "POST",
+      keepalive: false,
+      headers: {
+        "content-type": "application/json",
+        connection: "close",
+      },
+      body,
+      signal: controller?.signal,
+    }).catch((error) => {
+      if (error instanceof Error && error.name === "AbortError") return undefined
+      log.warn("auto reply request failed", { id: info.id, error })
+      return undefined
+    })
+    if (!res) return
+    if (!res.ok) {
+      log.warn("auto reply response not ok", { id: info.id, status: res.status })
+      return
+    }
+    const json = await res.json().catch((error) => {
+      log.warn("auto reply response invalid json", { id: info.id, error })
+      return undefined
+    })
+    if (!json) return
+    const parsed = Reply.safeParse(json)
+    if (!parsed.success) {
+      log.warn("auto reply response invalid payload", { id: info.id, error: parsed.error })
+      return
+    }
+    await reply({
+      requestID: info.id,
+      answers: parsed.data.answers,
+    })
+  }
+
+  function encode(question: Info) {
+    const options = question.options.map((option) => option.label)
+    return {
+      type: options.length === 0 ? "Free Text" : "Multiple Choice",
+      title: question.header,
+      message: question.question,
+      options,
+    }
   }
 
   export async function reply(input: { requestID: string; answers: Answer[] }): Promise<void> {
@@ -127,6 +184,7 @@ export namespace Question {
       log.warn("reply for unknown request", { requestID: input.requestID })
       return
     }
+    existing.controller?.abort()
     delete s.pending[input.requestID]
 
     log.info("replied", { requestID: input.requestID, answers: input.answers })
@@ -147,6 +205,7 @@ export namespace Question {
       log.warn("reject for unknown request", { requestID })
       return
     }
+    existing.controller?.abort()
     delete s.pending[requestID]
 
     log.info("rejected", { requestID })
