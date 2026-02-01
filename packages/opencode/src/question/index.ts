@@ -60,6 +60,10 @@ export namespace Question {
       .describe("User answers in order of questions (each answer is an array of selected labels)"),
   })
   export type Reply = z.infer<typeof Reply>
+  const AnswerEvent = z.object({
+    status: z.literal("answered"),
+    answer: z.union([z.string(), z.boolean()]),
+  })
 
   export const Event = {
     Asked: BusEvent.define("question.asked", Request),
@@ -87,7 +91,7 @@ export namespace Question {
         info: Request
         resolve: (answers: Answer[]) => void
         reject: (e: any) => void
-        controller?: AbortController
+        controllers?: AbortController[]
       }
     > = {}
 
@@ -104,7 +108,7 @@ export namespace Question {
     const s = await state()
     const id = Identifier.ascending("question")
     const url = Env.get("OPENCODE_QUESTION_URL")
-    const controller = url ? new AbortController() : undefined
+    const controllers = url ? input.questions.map(() => new AbortController()) : undefined
     const info: Request = {
       id,
       sessionID: input.sessionID,
@@ -119,23 +123,39 @@ export namespace Question {
         info,
         resolve,
         reject,
-        controller,
+        controllers,
       }
       Bus.publish(Event.Asked, info)
     })
     if (url) {
-      void auto(url, info, controller)
+      void auto(url, info, controllers)
     }
     return promise
   }
 
-  async function auto(url: string, info: Request, controller?: AbortController) {
-    const payload = info.questions.length === 1 ? encode(info.questions[0]) : info.questions.map(encode)
+  async function auto(url: string, info: Request, controllers?: AbortController[]) {
+    const result = await Promise.all(info.questions.map((question, index) => notify(url, question, controllers?.[index])))
+    if (result.some((answer) => !answer)) return
+    await reply({
+      requestID: info.id,
+      answers: result as Answer[],
+    })
+  }
+
+  async function notify(url: string, question: Info, controller?: AbortController) {
+    const payload = encode(question)
+    log.info("auto reply request", {
+      url,
+      type: payload.type,
+      title: payload.title,
+      options: payload.options?.length ?? 0,
+    })
     const body = JSON.stringify(payload)
     const res = await fetch(url, {
       method: "POST",
       keepalive: false,
       headers: {
+        accept: "text/event-stream",
         "content-type": "application/json",
         connection: "close",
       },
@@ -143,37 +163,83 @@ export namespace Question {
       signal: controller?.signal,
     }).catch((error) => {
       if (error instanceof Error && error.name === "AbortError") return undefined
-      log.warn("auto reply request failed", { id: info.id, error })
+      log.warn("auto reply request failed", { error })
       return undefined
     })
     if (!res) return
     if (!res.ok) {
-      log.warn("auto reply response not ok", { id: info.id, status: res.status })
+      log.warn("auto reply response not ok", { status: res.status, url })
       return
     }
-    const json = await res.json().catch((error) => {
-      log.warn("auto reply response invalid json", { id: info.id, error })
+    const text = await res.text().catch((error) => {
+      log.warn("auto reply response invalid text", { error, url })
       return undefined
     })
-    if (!json) return
-    const parsed = Reply.safeParse(json)
-    if (!parsed.success) {
-      log.warn("auto reply response invalid payload", { id: info.id, error: parsed.error })
-      return
+    if (!text) return
+    const answer = readAnswer(text)
+    if (answer === undefined) return
+    return decode(question, answer)
+  }
+
+  function readAnswer(text: string) {
+    const lines = text.split("\n")
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue
+      const data = parseJson(line.substring(6))
+      if (!data) continue
+      const parsed = AnswerEvent.safeParse(data)
+      if (!parsed.success) continue
+      return parsed.data.answer
     }
-    await reply({
-      requestID: info.id,
-      answers: parsed.data.answers,
-    })
+    return undefined
   }
 
   function encode(question: Info) {
     const options = question.options.map((option) => option.label)
+    const type = resolveType(options)
     return {
-      type: options.length === 0 ? "Free Text" : "Multiple Choice",
+      type,
       title: question.header,
       message: question.question,
-      options,
+      ...(type === "Multiple Choice" ? { options } : {}),
+    }
+  }
+
+  function decode(question: Info, answer: string | boolean): Answer {
+    if (typeof answer === "string") return [answer]
+    const options = question.options.map((option) => option.label)
+    const yes = matchYes(options)
+    const no = matchNo(options)
+    if (answer && yes) return [yes]
+    if (!answer && no) return [no]
+    return [answer ? "true" : "false"]
+  }
+
+  function resolveType(options: string[]) {
+    if (options.length === 0) return "Free Text"
+    if (isBoolean(options)) return "Boolean"
+    return "Multiple Choice"
+  }
+
+  function isBoolean(options: string[]) {
+    if (options.length !== 2) return false
+    return Boolean(matchYes(options)) && Boolean(matchNo(options))
+  }
+
+  function matchYes(options: string[]) {
+    return options.find((option) => option.trim().toLowerCase() === "yes")
+  }
+
+  function matchNo(options: string[]) {
+    return options.find((option) => option.trim().toLowerCase() === "no")
+  }
+
+  function parseJson(value: string) {
+    try {
+      return JSON.parse(value) as unknown
+    } catch (error) {
+      log.warn("auto reply response invalid json", { error })
+      return undefined
     }
   }
 
@@ -184,7 +250,9 @@ export namespace Question {
       log.warn("reply for unknown request", { requestID: input.requestID })
       return
     }
-    existing.controller?.abort()
+    for (const controller of existing.controllers ?? []) {
+      controller.abort()
+    }
     delete s.pending[input.requestID]
 
     log.info("replied", { requestID: input.requestID, answers: input.answers })
@@ -205,7 +273,9 @@ export namespace Question {
       log.warn("reject for unknown request", { requestID })
       return
     }
-    existing.controller?.abort()
+    for (const controller of existing.controllers ?? []) {
+      controller.abort()
+    }
     delete s.pending[requestID]
 
     log.info("rejected", { requestID })
